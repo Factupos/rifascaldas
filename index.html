@@ -142,9 +142,11 @@ header {
   display: flex;
   align-items: center;
   justify-content: flex-start; /* ← AQUÍ ESTÁ LA MAGIA: Alineado a la izquierda */
-  gap: 18px; /* Espacio perfecto para que respire */
+  gap: 18px;
   width: 100%;
   margin-bottom: 8px;
+  padding-right: 70px; /* <-- NUEVO: Reserva 70px a la derecha exclusivamente para el botón */
+  box-sizing: border-box; /* <-- NUEVO: Evita que el padding ensanche la pantalla */
 }
 
 .brand-info {
