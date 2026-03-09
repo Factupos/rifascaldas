@@ -2817,15 +2817,15 @@ async function fetchCsvAny(gid, timeoutEach=6000){
 }
 
 /* Fetch por "sheet + range" (robusto, evita depender de gid para Configuracion) */
+/* Fetch por "sheet + range" (robusto, evita depender de gid para Configuracion) */
 function rangeUrlsBySheet(sheetName, rangeA1){
   const ts = Date.now();
   const s = encodeURIComponent(sheetName);
   const r = encodeURIComponent(rangeA1);
-  // gviz soporta sheet + range muy bien (ideal para celdas sueltas)
+  // Solo usamos gviz/tq. Eliminamos el fallback de "export" porque 
+  // Google Sheets ignora el parámetro "sheet" en export y trae datos cruzados.
   return [
-    `https://docs.google.com/spreadsheets/d/${KEY}/gviz/tq?tqx=out:csv&sheet=${s}&range=${r}&_=${ts}`,
-    // fallback: a veces sheet+range funciona también en export
-    `https://docs.google.com/spreadsheets/d/${KEY}/export?format=csv&sheet=${s}&range=${r}&_=${ts}`
+    `https://docs.google.com/spreadsheets/d/${KEY}/gviz/tq?tqx=out:csv&sheet=${s}&range=${r}&_=${ts}`
   ];
 }
 async function fetchCsvBySheetRange(sheetName, rangeA1, timeoutEach=5500){
@@ -2922,21 +2922,17 @@ async function fetchBranches(){
       SUCURSALES_RANGE,
       5000
     );
-
     const rows = parseCSV(txt);
     if(!rows || rows.length <= 1) return [];
 
     const out = [];
-
     for(let i = 1; i < rows.length; i++){
       const row = rows[i] || [];
-
       const name = String(row[0] || '').trim();
       const detail = String(row[1] || '').trim();
       const rawSheetId = String(row[2] || '').trim();
       const image = String(row[3] || '').trim();
       const enabledRaw = String(row[4] || '').trim().toLowerCase();
-
       const enabled =
         enabledRaw === 'true' ||
         enabledRaw === 'verdadero' ||
@@ -2948,7 +2944,9 @@ async function fetchBranches(){
       if(!name && !detail && !image && !rawSheetId) continue;
 
       const branchIndex = out.length;
-      const sheetId = branchIndex === 0 ? BASE_KEY : sanitizeSheetId(rawSheetId);
+      
+      // ✅ ELIMINADA LA EXCEPCIÓN: Ahora siempre toma el ID de la columna C
+      const sheetId = sanitizeSheetId(rawSheetId);
 
       if(!name || !sheetId) continue;
 
@@ -2960,7 +2958,7 @@ async function fetchBranches(){
         image,
         sheetId,
         enabled: true,
-        isBase: branchIndex === 0
+        isBase: false // ✅ Ninguna sucursal es "Base" por defecto ahora
       });
     }
 
@@ -3015,17 +3013,16 @@ function hideBranchEnterOverlay(){
 function openBranch(branch){
   if(!branch || BRANCH_SELECTION_LOCK) return;
   BRANCH_SELECTION_LOCK = true;
-  const safeSheetId = sanitizeSheetId(branch.sheetId) || BASE_KEY;
-  const branchBid = branch.isBase ? 'base' : String(branch.index ?? '');
-
-  // Una sola carga: eliminamos la pantalla intermedia de entrada
-  // y dejamos únicamente el boot real de la página destino.
+  
+  // ✅ Siempre usa el sheetId específico de la sucursal de la columna C
+  const safeSheetId = sanitizeSheetId(branch.sheetId);
+  const branchBid = String(branch.index ?? '');
+  
   const active = document.querySelector(`.branch-card[data-branch-index="${Number(branch.index ?? 0)}"]`);
   if(active) active.classList.add('is-entering');
 
-  const targetUrl = branch.isBase
-    ? buildPanelUrl('', { branchopen:true, bid: 'base' })
-    : buildPanelUrl(safeSheetId, { branchopen:true, bid: branchBid });
+  // ✅ Siempre arma la URL forzando el ID propio de la sucursal
+  const targetUrl = buildPanelUrl(safeSheetId, { branchopen:true, bid: branchBid });
 
   location.href = targetUrl;
 }
@@ -3399,10 +3396,17 @@ function closeBox(withScale){
 }
 
 /* Abrir WhatsApp */
+/* Abrir WhatsApp */
 function openWA(payload){
-  const tel = window.__WHATSAPP_DIGITS || window.__CONFIG_PHONE_DIGITS || '';
-  let message = '';
+  // Forzamos a que use ÚNICAMENTE el número validado de esta sucursal
+  const tel = window.__WHATSAPP_DIGITS;
+  
+  if (!tel) {
+    msg('Error: Número de WhatsApp no configurado', true);
+    return;
+  }
 
+  let message = '';
   if (Array.isArray(payload)) {
     const unique = Array.from(new Set(payload.map(pad4)));
     if (!unique.length) return;
