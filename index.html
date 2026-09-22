@@ -2602,7 +2602,7 @@ const CACHE_META = Object.freeze({
   path: location.pathname
 });
 
-const MAP_CACHE_KEY   = `${CACHE_NS}_map_v3`;
+const MAP_CACHE_KEY   = `${CACHE_NS}_map_v4`;
 const CONF_CACHE_KEY  = `${CACHE_NS}_conf_v1`;
 const LOGO_CACHE_KEY  = `${CACHE_NS}_logo_v1`;
 const BLOCK_CACHE_KEY = `${CACHE_NS}_block_v1`;
@@ -2619,7 +2619,7 @@ function saveMapCache(freeList){
   try{
     localStorage.setItem(
       MAP_CACHE_KEY,
-      JSON.stringify({ ts: Date.now(), meta: CACHE_META, freeList })
+      JSON.stringify({ ts: Date.now(), meta: CACHE_META, freeList, digits: RAFFLE_DIGITS })
     );
   }catch(_){}
 }
@@ -2628,12 +2628,13 @@ function loadMapCache(){
     const raw = localStorage.getItem(MAP_CACHE_KEY);
     if(!raw) return null;
 
-    const { ts, meta, freeList } = JSON.parse(raw);
+    const { ts, meta, freeList, digits } = JSON.parse(raw);
     if(!cacheMetaOK(meta)) return null;
     if(!Array.isArray(freeList)) return null;
 
-    if(Date.now() - ts > CACHE_TTL_MS) return { freeList, stale: true };
-    return { freeList, stale: false };
+    const safeDigits = Number(digits) === 3 ? 3 : 4;
+    if(Date.now() - ts > CACHE_TTL_MS) return { freeList, digits: safeDigits, stale: true };
+    return { freeList, digits: safeDigits, stale: false };
   }catch(_){
     return null;
   }
@@ -2798,11 +2799,30 @@ const csvUrls = (gid) => {
     `https://docs.google.com/spreadsheets/d/${KEY}/gviz/tq?tqx=out:csv&gid=${gid}&_=${ts}`
   ];
 };
-function fetchWithTimeout(url, timeout=6000){
-  const ctrl = new AbortController();
-  const to = setTimeout(()=>ctrl.abort(), timeout);
-  return fetch(PROXY + encodeURIComponent(url), {signal:ctrl.signal, cache:'no-store', credentials:'omit'})
-    .then(r=>{clearTimeout(to); if(!r.ok) throw new Error('HTTP '+r.status); return r.text()});
+async function fetchWithTimeout(url, timeout=6000){
+  const fetchOne = async (target) => {
+    const ctrl = new AbortController();
+    const to = setTimeout(()=>ctrl.abort(), timeout);
+    try{
+      const r = await fetch(target, {
+        signal: ctrl.signal,
+        cache: 'no-store',
+        credentials: 'omit'
+      });
+      if(!r.ok) throw new Error('HTTP ' + r.status);
+      return await r.text();
+    } finally {
+      clearTimeout(to);
+    }
+  };
+
+  // 1) Intento directo: evita que el Worker sea un punto único de falla.
+  try{
+    return await fetchOne(url);
+  }catch(_directError){
+    // 2) Respaldo: proxy actual.
+    return await fetchOne(PROXY + encodeURIComponent(url));
+  }
 }
 async function fetchCsvAny(gid, timeoutEach=6000){
   const urls = csvUrls(gid);
@@ -3177,13 +3197,18 @@ async function maybeStartBranchSelector(){
 /* =========================
    Estado global liviano
    ========================= */
-let ALL = {};             // { "0000": "libre"/"ocupado" }
+let ALL = {};             // { "000"/"0000": "libre"/"ocupado" }
 let DAILY = [];           // hasta 240 render inmediato
 let SEARCH_INPUT = null;
 let GRID_TIMER = null;
 let MAP_TIMER = null;
 let MODAL_OPEN = false;
 let DAY_MARK = null;
+
+// Se detecta automáticamente por cada sucursal:
+// 3 cifras => 000...999
+// 4 cifras => 0000...9999
+let RAFFLE_DIGITS = 4;
 
 /* Carrito de compras */
 let CART_ACTIVE = false;
@@ -3192,7 +3217,48 @@ let CART_ITEMS = [];
 /* =========================
    Utils
    ========================= */
-const pad4 = n => String(n).replace(/\D/g,'').slice(0,4).padStart(4,'0');
+function setRaffleDigits(value){
+  RAFFLE_DIGITS = Number(value) === 3 ? 3 : 4;
+  window.__RAFFLE_DIGITS = RAFFLE_DIGITS;
+
+  const input = document.getElementById('search');
+  if(input){
+    input.maxLength = RAFFLE_DIGITS;
+    input.placeholder = '0'.repeat(RAFFLE_DIGITS);
+
+    // Si se cambia de sucursal/formato, nunca conservar más dígitos de los permitidos.
+    const clean = String(input.value || '').replace(/\D/g,'').slice(0, RAFFLE_DIGITS);
+    if(input.value !== clean) input.value = clean;
+  }
+}
+
+function detectRaffleDigits(rows){
+  let sawNumber = false;
+
+  for(let i=1; i<(rows?.length || 0); i++){
+    const raw = String(rows[i]?.[0] ?? '').trim();
+    const digits = raw.replace(/\D/g,'');
+    if(!digits) continue;
+
+    sawNumber = true;
+
+    // Cualquier número real >= 1000 confirma una rifa de 4 cifras.
+    const numeric = Number(digits);
+    if(digits.length >= 4 || (Number.isFinite(numeric) && numeric >= 1000)){
+      return 4;
+    }
+  }
+
+  // Si la hoja tiene números y ninguno supera 999, corresponde a 3 cifras.
+  return sawNumber ? 3 : 4;
+}
+
+// Se conserva el nombre pad4 para que el cambio sea quirúrgico,
+// pero ahora respeta dinámicamente 3 o 4 cifras.
+const pad4 = n => String(n)
+  .replace(/\D/g,'')
+  .slice(0, RAFFLE_DIGITS)
+  .padStart(RAFFLE_DIGITS,'0');
 const todayKey = () => new Date().toISOString().slice(0,10);
 function randInt(maxExclusive){
   if (crypto?.getRandomValues){ const b = new Uint32Array(1); crypto.getRandomValues(b); return b[0] % maxExclusive; }
@@ -3216,7 +3282,7 @@ function parseCSV(text){
   }
   push(); return rows.filter(r => r.some(x=>String(x).trim()!=='')); 
 }
-function makeBaseMap(){ const map={}; for(let i=0;i<10000;i++){ map[String(i).padStart(4,'0')]='ocupado' } return map }
+function makeBaseMap(){ const map={}; const total=10 ** RAFFLE_DIGITS; for(let i=0;i<total;i++){ map[String(i).padStart(RAFFLE_DIGITS,'0')]='ocupado' } return map }
 function normStatusAB(s){ const t=String(s??'').trim().toLowerCase(); return t==='libre' ? 'libre' : 'ocupado' }
 function extractColombiaDigits(raw){
   const chunks=(String(raw||'').match(/\d+/g)||[]); let d=chunks.join(''); d=d.replace(/^00/,'');
@@ -3343,11 +3409,44 @@ function setFaviconFromUrl(url){
 function applyLogoUrl(url){
   const u = String(url||'').trim();
   if(!u) return;
-  const img = document.getElementById('logoImg');
-  const bimg = document.getElementById('bootLogoImg');
-  if(img) img.src = u;
-  if(bimg) bimg.src = u;
-  setFaviconFromUrl(u);
+
+  // Evita disparar varias veces la misma URL (logo + boot + favicon).
+  if(window.__LOGO_LOADING_URL === u || window.__LOGO_OK_URL === u) return;
+  window.__LOGO_LOADING_URL = u;
+
+  const probe = new Image();
+  probe.referrerPolicy = 'no-referrer';
+
+  probe.onload = ()=>{
+    window.__LOGO_LOADING_URL = '';
+    window.__LOGO_OK_URL = u;
+
+    const img = document.getElementById('logoImg');
+    const bimg = document.getElementById('bootLogoImg');
+    const mimg = document.getElementById('branchMainLogo');
+
+    if(img) img.src = u;
+    if(bimg) bimg.src = u;
+    if(mimg) mimg.src = u;
+
+    // Solo se usa como favicon después de confirmar que la imagen realmente carga.
+    setFaviconFromUrl(u);
+  };
+
+  probe.onerror = ()=>{
+    window.__LOGO_LOADING_URL = '';
+
+    // Si la URL guardada quedó obsoleta o el host no resuelve, no insistimos
+    // una y otra vez en esta misma carga.
+    try{
+      const cached = loadLogoCache();
+      if(cached?.logo === u) localStorage.removeItem(LOGO_CACHE_KEY);
+    }catch(_){}
+
+    console.warn('No fue posible cargar el logo:', u);
+  };
+
+  probe.src = u;
 }
 async function loadLogoFast(){
   const cached = loadLogoCache();
@@ -3481,7 +3580,7 @@ function renderCart(){
 }
 function setTileSelected(num, selected){
   const p = pad4(num);
-  // Números son 4 dígitos, así que el selector es seguro y ultra rápido
+  // El número ya viene normalizado al formato dinámico de esta sucursal
   document.querySelectorAll(`.raffle[data-num="${p}"]`).forEach(el=>{
     el.classList.toggle('selected', !!selected);
   });
@@ -3668,12 +3767,16 @@ async function syncMapFast(){
     const txt = await fetchCsvAny(GID_RAFFLES, 6000);
     const rows = parseCSV(txt);
     if(rows.length < 2) return;
+
+    // Detecta automáticamente si ESTA sucursal usa 000-999 o 0000-9999.
+    setRaffleDigits(detectRaffleDigits(rows));
+
     const freeList=[];
     for(let i=1;i<rows.length;i++){
       const r=rows[i]||[]; const a=(r[0]??'').toString().trim(); const b=(r[1]??'').toString().trim();
       if(!a) continue; let digits=a.replace(/\D/g,''); if(!digits) continue;
-      if(digits.length>4) digits=digits.slice(0,4);
-      const num=digits.padStart(4,'0');
+      if(digits.length>RAFFLE_DIGITS) digits=digits.slice(0,RAFFLE_DIGITS);
+      const num=digits.padStart(RAFFLE_DIGITS,'0');
       if (normStatusAB(b)==='libre') freeList.push(num);
     }
     saveMapCache(freeList);
@@ -3690,7 +3793,7 @@ async function syncMapFast(){
    ========================= */
 async function rerenderSearch(){
   const layer=document.getElementById('searchResult'); hideMsg();
-  const raw=(SEARCH_INPUT.value||'').replace(/\D/g,'').slice(0,4);
+  const raw=(SEARCH_INPUT.value||'').replace(/\D/g,'').slice(0,RAFFLE_DIGITS);
   if(SEARCH_INPUT.value!==raw) SEARCH_INPUT.value=raw;
   layer.style.display='none'; layer.innerHTML='';
   if(raw.length===0){ document.body.classList.remove('search-has-text'); return; }
@@ -4033,11 +4136,11 @@ document.addEventListener('DOMContentLoaded', async ()=>{
     document.body.classList.add('search-has-text');
 
     if(!ALL || !Object.keys(ALL).length){
-      const c=loadMapCache(); if(c?.freeList){ setAllFromFreeList(c.freeList); }
+      const c=loadMapCache(); if(c?.freeList){ setRaffleDigits(c.digits); setAllFromFreeList(c.freeList); }
       else { await syncMapFast(); }
     }
     const libres=Object.keys(ALL||{}).filter(k=>ALL[k]==='libre');
-    const chosen = libres.length ? libres[randInt(libres.length)] : String(randInt(10000)).padStart(4,'0');
+    const chosen = libres.length ? libres[randInt(libres.length)] : String(randInt(10 ** RAFFLE_DIGITS)).padStart(RAFFLE_DIGITS,'0');
 
     const placeholder=document.createElement('div'); placeholder.className='raffle large-raffle'; layer.appendChild(placeholder); layer.style.display='flex';
 
@@ -4093,6 +4196,7 @@ document.addEventListener('DOMContentLoaded', async ()=>{
 
   const mcache=loadMapCache();
   if(mcache?.freeList){
+    setRaffleDigits(mcache.digits);
     setAllFromFreeList(mcache.freeList);
     pickDaily(true);
     renderGrid();
