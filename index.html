@@ -2807,7 +2807,8 @@ async function fetchWithTimeout(url, timeout=6000){
       const r = await fetch(target, {
         signal: ctrl.signal,
         cache: 'no-store',
-        credentials: 'omit'
+        credentials: 'omit',
+        redirect: 'follow'
       });
       if(!r.ok) throw new Error('HTTP ' + r.status);
       return await r.text();
@@ -2816,28 +2817,42 @@ async function fetchWithTimeout(url, timeout=6000){
     }
   };
 
-  // 1) Intento directo: evita que el Worker sea un punto único de falla.
+  // Limpia el parámetro anti-cache: en algunos libros la redirección
+  // de Google Sheets a googleusercontent.com termina en HTTP 400.
+  const cleanUrl = String(url || '').replace(/([?&])_=\d+(&?)/, (all, p1, p2) => p2 ? p1 : '');
+
+  // Para lectura pública preferimos GViz, que evita la ruta /export
+  // que está fallando en la sucursal de 3 cifras.
+  let gvizUrl = cleanUrl;
   try{
-    return await fetchOne(url);
-  }catch(_directError){
-    // 2) Respaldo: proxy actual.
-    return await fetchOne(PROXY + encodeURIComponent(url));
+    const u = new URL(cleanUrl);
+    const match = u.pathname.match(/\/spreadsheets\/d\/([^/]+)/);
+    const gid = u.searchParams.get('gid');
+    if(match && gid){
+      gvizUrl = `https://docs.google.com/spreadsheets/d/${match[1]}/gviz/tq?tqx=out:csv&gid=${encodeURIComponent(gid)}`;
+    }
+  }catch(_){}
+
+  let lastError = null;
+
+  for(const target of [...new Set([gvizUrl, cleanUrl])]){
+    try{
+      return await fetchOne(target);
+    }catch(err){
+      lastError = err;
+    }
   }
-}
-async function fetchCsvAny(gid, timeoutEach=6000){
-  const urls = csvUrls(gid);
-  const attempts = urls.map(u => fetchWithTimeout(u, timeoutEach).then(txt=>{
-    if(txt && !txt.trimStart().startsWith('<')) return txt;
-    throw new Error('Respuesta inválida');
-  }));
-  return new Promise((resolve, reject)=>{
-    let rej=0, reason=null;
-    attempts.forEach(p => p.then(resolve).catch(e=>{reason=e; if(++rej===attempts.length) reject(reason)}));
-  });
+
+  // El Worker queda solamente como último respaldo.
+  try{
+    return await fetchOne(PROXY + encodeURIComponent(gvizUrl));
+  }catch(err){
+    lastError = err;
+  }
+
+  throw lastError || new Error('No fue posible leer Google Sheets');
 }
 
-/* Fetch por "sheet + range" (robusto, evita depender de gid para Configuracion) */
-/* Fetch por "sheet + range" (robusto, evita depender de gid para Configuracion) */
 function rangeUrlsBySheet(sheetName, rangeA1){
   const ts = Date.now();
   const s = encodeURIComponent(sheetName);
@@ -3233,23 +3248,23 @@ function setRaffleDigits(value){
 }
 
 function detectRaffleDigits(rows){
-  let sawNumber = false;
+  const dataRows = Math.max(0, (rows?.length || 0) - 1);
 
+  // Más de 1000 registros identifica una rifa de 4 cifras incluso si
+  // Google elimina los ceros iniciales al generar el CSV.
+  if(dataRows > 1000) return 4;
+
+  let sawNumber = false;
   for(let i=1; i<(rows?.length || 0); i++){
     const raw = String(rows[i]?.[0] ?? '').trim();
     const digits = raw.replace(/\D/g,'');
     if(!digits) continue;
-
     sawNumber = true;
-
-    // Cualquier número real >= 1000 confirma una rifa de 4 cifras.
     const numeric = Number(digits);
     if(digits.length >= 4 || (Number.isFinite(numeric) && numeric >= 1000)){
       return 4;
     }
   }
-
-  // Si la hoja tiene números y ninguno supera 999, corresponde a 3 cifras.
   return sawNumber ? 3 : 4;
 }
 
