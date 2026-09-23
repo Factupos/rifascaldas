@@ -2602,7 +2602,7 @@ const CACHE_META = Object.freeze({
   path: location.pathname
 });
 
-const MAP_CACHE_KEY   = `${CACHE_NS}_map_v4`;
+const MAP_CACHE_KEY   = `${CACHE_NS}_map_v5`;
 const CONF_CACHE_KEY  = `${CACHE_NS}_conf_v1`;
 const LOGO_CACHE_KEY  = `${CACHE_NS}_logo_v1`;
 const BLOCK_CACHE_KEY = `${CACHE_NS}_block_v1`;
@@ -3781,25 +3781,61 @@ async function syncMapFast(){
   try{
     const txt = await fetchCsvAny(GID_RAFFLES, 6000);
     const rows = parseCSV(txt);
-    if(rows.length < 2) return;
+    if(!rows.length) return;
 
     // Detecta automáticamente si ESTA sucursal usa 000-999 o 0000-9999.
     setRaffleDigits(detectRaffleDigits(rows));
 
     const freeList=[];
-    for(let i=1;i<rows.length;i++){
-      const r=rows[i]||[]; const a=(r[0]??'').toString().trim(); const b=(r[1]??'').toString().trim();
-      if(!a) continue; let digits=a.replace(/\D/g,''); if(!digits) continue;
-      if(digits.length>RAFFLE_DIGITS) digits=digits.slice(0,RAFFLE_DIGITS);
-      const num=digits.padStart(RAFFLE_DIGITS,'0');
-      if (normStatusAB(b)==='libre') freeList.push(num);
+
+    /*
+      IMPORTANTE:
+      No asumimos que rows[0] sea siempre encabezado.
+      En las páginas de 3 cifras los números reales están en Sheets
+      exactamente entre las filas 2 y 1001. Dependiendo de GViz,
+      la primera fila devuelta puede ser encabezado o puede ser ya
+      el primer número. Por eso recorremos TODO lo recibido y solo
+      aceptamos filas cuya columna A sea realmente un número válido.
+    */
+    for(let i=0;i<rows.length;i++){
+      const r=rows[i]||[];
+      const a=(r[0]??'').toString().trim();
+      const b=(r[1]??'').toString().trim();
+
+      if(!a) continue;
+
+      // La columna A debe representar exclusivamente el número de la boleta.
+      const rawDigits=a.replace(/\D/g,'');
+      if(!rawDigits) continue;
+
+      const numeric=Number(rawDigits);
+      const maxNumber=(10 ** RAFFLE_DIGITS)-1;
+      if(!Number.isFinite(numeric) || numeric < 0 || numeric > maxNumber) continue;
+
+      const num=String(numeric).padStart(RAFFLE_DIGITS,'0');
+
+      if(normStatusAB(b)==='libre'){
+        freeList.push(num);
+      }
     }
-    saveMapCache(freeList);
-    setAllFromFreeList(freeList);
+
+    // Evita duplicados y garantiza que 000-999 funcionen como catálogo real.
+    const uniqueFree=[...new Set(freeList)];
+
+    saveMapCache(uniqueFree);
+    setAllFromFreeList(uniqueFree);
+
     const before=DAILY.length;
     DAILY = DAILY.filter(n=>ALL[n]==='libre');
-    if(DAILY.length===0){ pickDaily(true); }
-    if(DAILY.length!==before){ renderGrid(); }
+
+    if(DAILY.length===0){
+      pickDaily(true);
+    }
+
+    // Siempre refrescamos después de una sincronización correcta.
+    // Antes solo se redibujaba si cambiaba DAILY.length, lo que podía
+    // dejar visualmente vacía una sucursal aunque ALL ya tuviera libres.
+    renderGrid();
   }catch(_){ }
 }
 
