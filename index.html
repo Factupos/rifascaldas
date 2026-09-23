@@ -3859,7 +3859,12 @@ async function syncMapFast(){
     DAILY = DAILY.filter(n=>ALL[n]==='libre');
     if(DAILY.length===0) pickDaily(true);
     renderGrid();
-    rerenderSearchIfNeeded();
+
+    // Si había una búsqueda escrita, la refrescamos usando la función
+    // real existente en esta aplicación.
+    if(typeof rerenderSearch === 'function'){
+      rerenderSearch();
+    }
   }catch(err){
     console.error('Error sincronizando boletas:', err);
   }
