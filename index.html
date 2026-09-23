@@ -2564,6 +2564,7 @@ const GID_CONFIG  = '1842804307';    // Config_Publica
 const GID_NOTIFICATIONS = '1029797655'; // Notificaciones (logo)
 const PROXY = 'https://csv-proxy.jeisendigital.workers.dev/?u=';
 const SUCURSALES_SHEET_NAME = 'Sucursales';
+const THREE_DIGIT_RAFFLE_SHEET_NAME = 'Numero_De_Rifas';
 const SUCURSALES_RANGE = 'A:F';
 
 /* =========================================================
@@ -2603,7 +2604,7 @@ const CACHE_META = Object.freeze({
   path: location.pathname
 });
 
-const MAP_CACHE_KEY   = `${CACHE_NS}_map_v9`;
+const MAP_CACHE_KEY   = `${CACHE_NS}_map_v11`;
 const CONF_CACHE_KEY  = `${CACHE_NS}_conf_v1`;
 const LOGO_CACHE_KEY  = `${CACHE_NS}_logo_v1`;
 const BLOCK_CACHE_KEY = `${CACHE_NS}_block_v1`;
@@ -3861,134 +3862,153 @@ function pickDaily(force=false){
 /* =========================
    Sincronización remota
    ========================= */
+
+function scoreThreeDigitRaffleRows(rows){
+  let numeric=0, libres=0, header=0;
+  for(let i=0;i<(rows?.length || 0) && i<1002;i++){
+    const r=rows[i] || [];
+    const a=String(r[0] ?? '').trim();
+    const b=String(r[1] ?? '').trim().toLowerCase();
+
+    if(/numero[_\s-]*de[_\s-]*rifa/i.test(a)) header += 5000;
+
+    if(/^\d{1,3}$/.test(a)){
+      const n=Number(a);
+      if(n>=0 && n<=999){
+        numeric++;
+        if(b==='libre') libres++;
+      }
+    }
+  }
+  return { score: header + numeric + (libres*10), numeric, libres, header: header>0 };
+}
+
+async function fetchThreeDigitRaffleCsvRobust(){
+  const TAG='[RIFAS DEBUG]';
+
+  // FUENTE ÚNICA Y DETERMINÍSTICA PARA RIFAS DE 3 CIFRAS.
+  // Nunca busca GIDs ni prueba otras pestañas.
+  const url =
+    `https://docs.google.com/spreadsheets/d/${encodeURIComponent(KEY)}` +
+    `/gviz/tq?tqx=out:csv` +
+    `&sheet=${encodeURIComponent(THREE_DIGIT_RAFFLE_SHEET_NAME)}` +
+    `&range=A1:B1001`;
+
+  console.log(`${TAG} Leyendo directamente: ${THREE_DIGIT_RAFFLE_SHEET_NAME}!A1:B1001`);
+
+  const txt = await fetchWithTimeout(url, 6000);
+  const rows = parseCSV(txt);
+  const quality = scoreThreeDigitRaffleRows(rows);
+
+  console.log(`${TAG} Resultado lectura directa:`, {
+    hoja: THREE_DIGIT_RAFFLE_SHEET_NAME,
+    rango: 'A1:B1001',
+    filas: rows.length,
+    numeros_000_999: quality.numeric,
+    libres: quality.libres,
+    encabezado_Numero_De_Rifa: quality.header,
+    primeras_filas: rows.slice(0,6)
+  });
+
+  if(quality.numeric < 900){
+    throw new Error(
+      `La hoja ${THREE_DIGIT_RAFFLE_SHEET_NAME} no devolvió el catálogo esperado 000-999. ` +
+      `Solo se detectaron ${quality.numeric} números válidos.`
+    );
+  }
+
+  return {
+    name: `${THREE_DIGIT_RAFFLE_SHEET_NAME}!A1:B1001`,
+    url,
+    txt,
+    rows,
+    quality
+  };
+}
+
 async function syncMapFast(){
-  const TAG = '[RIFAS DEBUG]';
+  const TAG='[RIFAS DEBUG]';
   console.group(`${TAG} Sincronización de boletas`);
   try{
-    console.log('1. Sucursal / hoja seleccionada:', KEY);
-    console.log('2. ssid URL:', SELECTED_BRANCH_KEY || '(base)');
-    console.log('3. Cifras configuradas:', CONFIGURED_RAFFLE_DIGITS);
-    console.log('4. GID de boletas usado:', GID_RAFFLES);
-
     setRaffleDigits(CONFIGURED_RAFFLE_DIGITS);
 
-    const txt = await fetchCsvAny(GID_RAFFLES, 6000);
-    console.log('5. CSV recibido. Caracteres:', txt?.length || 0);
-    console.log('6. Primeros 500 caracteres del CSV:', String(txt || '').slice(0,500));
+    let txt='';
+    let sourceName='';
 
-    const rows = parseCSV(txt);
-    console.log('7. Filas CSV parseadas:', rows.length);
-    console.log('8. Primeras 12 filas parseadas:', rows.slice(0,12));
-
-    if(!rows.length){
-      console.error(`${TAG} PROBLEMA: Google devolvió 0 filas.`);
-      return;
+    if(RAFFLE_DIGITS===3){
+      const found=await fetchThreeDigitRaffleCsvRobust();
+      txt=found.txt;
+      sourceName=found.name;
+      console.log(`${TAG} FUENTE ELEGIDA PARA 3 CIFRAS:`, sourceName);
+      console.log(`${TAG} Calidad de la fuente:`, found.quality);
+    }else{
+      txt=await fetchCsvAny(GID_RAFFLES,6000);
+      sourceName=`GID ${GID_RAFFLES}`;
     }
+
+    const rows=parseCSV(txt);
+    console.log(`${TAG} Fuente final:`, sourceName);
+    console.log(`${TAG} Filas recibidas:`, rows.length);
+    console.log(`${TAG} Primeras 8 filas:`, rows.slice(0,8));
 
     const freeList=[];
     const statusCounts={};
-    const rejected={
-      emptyA:0,
-      noDigits:0,
-      outOfRange:0,
-      notLibre:0
-    };
+    let numericRows=0;
 
-    /*
-      3 cifras:
-      Google/CSV puede devolver o no devolver encabezados exactamente igual
-      que Sheets. Por eso NO dependemos de una posición fija del encabezado.
-      Inspeccionamos como máximo las primeras 1001 filas recibidas y aceptamos
-      únicamente números reales 000..999.
-    */
-    const maxRowsToInspect = RAFFLE_DIGITS === 3
-      ? Math.min(rows.length, 1001)
-      : rows.length;
+    // En 3 cifras solo se aceptan 000..999 y como máximo el bloque 1..1001.
+    const limit=RAFFLE_DIGITS===3 ? Math.min(rows.length,1001) : rows.length;
 
-    for(let i=0; i<maxRowsToInspect; i++){
-      const r=rows[i] || [];
-      const a=String(r[0] ?? '').trim();
-      const b=String(r[1] ?? '').trim();
+    for(let i=0;i<limit;i++){
+      const r=rows[i]||[];
+      const a=String(r[0]??'').trim();
+      const b=String(r[1]??'').trim();
+      if(!/^\d+$/.test(a)) continue;
 
-      if(!a){ rejected.emptyA++; continue; }
+      const n=Number(a);
+      const max=RAFFLE_DIGITS===3 ? 999 : 9999;
+      if(!Number.isInteger(n) || n<0 || n>max) continue;
 
-      // Solo aceptamos una celda A que sea un número de rifa puro.
-      const rawDigits=a.replace(/\D/g,'');
-      if(!rawDigits){ rejected.noDigits++; continue; }
+      numericRows++;
+      const status=b.toLowerCase();
+      statusCounts[status]=(statusCounts[status]||0)+1;
 
-      const numeric=Number(rawDigits);
-      const maxNumber=RAFFLE_DIGITS === 3 ? 999 : 9999;
-      if(!Number.isInteger(numeric) || numeric < 0 || numeric > maxNumber){
-        rejected.outOfRange++;
-        continue;
-      }
-
-      const normalizedStatus=String(b || '').trim().toLowerCase();
-      statusCounts[normalizedStatus]=(statusCounts[normalizedStatus] || 0)+1;
-
-      const num=String(numeric).padStart(RAFFLE_DIGITS,'0');
-      if(normalizedStatus === 'libre'){
-        freeList.push(num);
-      }else{
-        rejected.notLibre++;
+      if(status==='libre'){
+        freeList.push(String(n).padStart(RAFFLE_DIGITS,'0'));
       }
     }
 
     const uniqueFree=[...new Set(freeList)];
 
-    console.log('9. Filas inspeccionadas:', maxRowsToInspect);
-    console.log('10. Estados encontrados en columna B:', statusCounts);
-    console.log('11. Filas descartadas:', rejected);
-    console.log('12. Boletas LIBRES encontradas:', uniqueFree.length);
-    console.log('13. Primeras 30 libres:', uniqueFree.slice(0,30));
+    console.log(`${TAG} Números válidos encontrados:`, numericRows);
+    console.log(`${TAG} Estados encontrados:`, statusCounts);
+    console.log(`${TAG} LIBRES encontradas:`, uniqueFree.length);
+    console.log(`${TAG} Primeras 40 libres:`, uniqueFree.slice(0,40));
 
+    if(RAFFLE_DIGITS===3 && numericRows<900){
+      console.error(`${TAG} ALERTA: la fuente elegida NO contiene las 1000 boletas 000-999. Fuente: ${sourceName}`);
+    }
     if(uniqueFree.length===0){
-      console.error(`${TAG} PROBLEMA REAL: se leyeron filas, pero NO se encontró ninguna boleta con estado "Libre".`);
-      console.error(`${TAG} Revisa especialmente los puntos 6, 8 y 10 de este log. Ahí veremos qué columnas y estados está entregando realmente Google.`);
+      console.error(`${TAG} ALERTA: la fuente elegida no contiene ninguna boleta Libre.`);
     }
 
     saveMapCache(uniqueFree);
     setAllFromFreeList(uniqueFree);
 
-    const libresEnALL=Object.keys(ALL || {}).filter(k=>ALL[k]==='libre');
-    console.log('14. Libres guardadas en ALL:', libresEnALL.length);
-
-    // IMPORTANTE: reconstruimos DAILY SIEMPRE desde la lectura remota actual.
-    // No dependemos de una lista diaria antigua de 4 cifras.
-    DAILY = sampleDailyFromFreeList(uniqueFree, 240);
+    // Para 3 cifras, construir la muestra directamente desde la fuente correcta.
+    DAILY=sampleDailyFromFreeList(uniqueFree,240);
     persistDaily();
-
-    console.log('15. Boletas elegidas para mostrar (DAILY):', DAILY.length);
-    console.log('16. Primeras 30 DAILY:', DAILY.slice(0,30));
-
-    // Evita que una búsqueda previa o un estado visual viejo oculte la grilla.
-    const searchInput=document.getElementById('search');
-    if(searchInput && !searchInput.value){
-      document.body.classList.remove('search-has-text');
-    }
-
     renderGrid();
 
     const wrap=document.getElementById('raffles');
-    console.log('17. Elemento #raffles existe:', !!wrap);
-    console.log('18. Tiles dibujados en #raffles:', wrap ? wrap.children.length : 0);
-    console.log('19. display de #raffles:', wrap ? getComputedStyle(wrap).display : '(no existe)');
-    console.log('20. ¿MODAL_OPEN?:', typeof MODAL_OPEN !== 'undefined' ? MODAL_OPEN : '(no definido)');
-    console.log('21. ¿body tiene search-has-text?:', document.body.classList.contains('search-has-text'));
+    console.log(`${TAG} DAILY:`, DAILY.length);
+    console.log(`${TAG} Tiles pintados:`, wrap ? wrap.children.length : 0);
 
-    if(uniqueFree.length>0 && wrap && wrap.children.length===0){
-      console.error(`${TAG} HAY BOLETAS LIBRES PERO renderGrid NO LAS ESTÁ PINTANDO.`);
-      console.error(`${TAG} Si el punto 20 es true o el 21 es true, ese estado visual está bloqueando renderGrid().`);
+    if(uniqueFree.length>0 && (!wrap || wrap.children.length===0)){
+      console.error(`${TAG} Hay libres pero la grilla no las pintó. El problema ya sería exclusivamente renderGrid().`);
     }
-
-    if(typeof rerenderSearch === 'function' && searchInput && searchInput.value){
-      await rerenderSearch();
-    }
-
-    console.log(`${TAG} Sincronización terminada.`);
   }catch(err){
-    console.error(`${TAG} ERROR COMPLETO EN syncMapFast:`, err);
-    console.error(err?.stack || '');
+    console.error(`${TAG} ERROR COMPLETO:`,err);
+    console.error(err?.stack||'');
   }finally{
     console.groupEnd();
   }
