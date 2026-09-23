@@ -2603,7 +2603,7 @@ const CACHE_META = Object.freeze({
   path: location.pathname
 });
 
-const MAP_CACHE_KEY   = `${CACHE_NS}_map_v7`;
+const MAP_CACHE_KEY   = `${CACHE_NS}_map_v8`;
 const CONF_CACHE_KEY  = `${CACHE_NS}_conf_v1`;
 const LOGO_CACHE_KEY  = `${CACHE_NS}_logo_v1`;
 const BLOCK_CACHE_KEY = `${CACHE_NS}_block_v1`;
@@ -2634,8 +2634,12 @@ function loadMapCache(){
     if(!Array.isArray(freeList)) return null;
 
     const safeDigits = Number(digits) === 3 ? 3 : 4;
-    if(Date.now() - ts > CACHE_TTL_MS) return { freeList, digits: safeDigits, stale: true };
-    return { freeList, digits: safeDigits, stale: false };
+
+    // Never reuse a map generated for a different number width.
+    if(safeDigits !== CONFIGURED_RAFFLE_DIGITS) return null;
+
+    if(Date.now() - ts > CACHE_TTL_MS) return { freeList, digits: CONFIGURED_RAFFLE_DIGITS, stale: true };
+    return { freeList, digits: CONFIGURED_RAFFLE_DIGITS, stale: false };
   }catch(_){
     return null;
   }
@@ -3026,6 +3030,7 @@ async function fetchBranches(){
         detail,
         image,
         sheetId,
+        digits,
         enabled: true,
         isBase: false // ✅ Ninguna sucursal es "Base" por defecto ahora
       });
@@ -3261,7 +3266,8 @@ let DAY_MARK = null;
 // Se detecta automáticamente por cada sucursal:
 // 3 cifras => 000...999
 // 4 cifras => 0000...9999
-let RAFFLE_DIGITS = Number(BRANCH_DIGITS_PARAM) === 3 ? 3 : 4;
+let CONFIGURED_RAFFLE_DIGITS = Number(BRANCH_DIGITS_PARAM) === 3 ? 3 : 4;
+let RAFFLE_DIGITS = CONFIGURED_RAFFLE_DIGITS;
 
 /* Carrito de compras */
 let CART_ACTIVE = false;
@@ -3270,6 +3276,45 @@ let CART_ITEMS = [];
 /* =========================
    Utils
    ========================= */
+async function resolveRaffleDigitsFromBranchConfig(){
+  // If the selector already sent ?digits=3/4, that value is authoritative.
+  if(Number(BRANCH_DIGITS_PARAM) === 3 || Number(BRANCH_DIGITS_PARAM) === 4){
+    CONFIGURED_RAFFLE_DIGITS = Number(BRANCH_DIGITS_PARAM);
+    setRaffleDigits(CONFIGURED_RAFFLE_DIGITS);
+    return CONFIGURED_RAFFLE_DIGITS;
+  }
+
+  // Robust fallback for old links: locate the selected spreadsheet in
+  // BASE_KEY -> Sucursales!A:F and read its column F.
+  if(sanitizeSheetId(SELECTED_BRANCH_KEY)){
+    try{
+      const txt = await fetchCsvBySheetRangeFromKey(
+        BASE_KEY,
+        SUCURSALES_SHEET_NAME,
+        'A:F',
+        6000
+      );
+      const rows = parseCSV(txt);
+
+      for(let i=1; i<(rows?.length || 0); i++){
+        const row = rows[i] || [];
+        const sheetId = sanitizeSheetId(String(row[2] || '').trim());
+        if(sheetId && sheetId === sanitizeSheetId(SELECTED_BRANCH_KEY)){
+          CONFIGURED_RAFFLE_DIGITS = Number(String(row[5] || '').trim()) === 3 ? 3 : 4;
+          setRaffleDigits(CONFIGURED_RAFFLE_DIGITS);
+          return CONFIGURED_RAFFLE_DIGITS;
+        }
+      }
+    }catch(err){
+      console.error('No fue posible leer Sucursales!F:', err);
+    }
+  }
+
+  CONFIGURED_RAFFLE_DIGITS = 4;
+  setRaffleDigits(4);
+  return 4;
+}
+
 function setRaffleDigits(value){
   RAFFLE_DIGITS = Number(value) === 3 ? 3 : 4;
   window.__RAFFLE_DIGITS = RAFFLE_DIGITS;
@@ -3824,7 +3869,7 @@ async function syncMapFast(){
 
     // La cantidad de cifras YA NO se adivina desde la hoja de boletas.
     // Viene exclusivamente de Sucursales!F a través del parámetro digits.
-    setRaffleDigits(Number(BRANCH_DIGITS_PARAM) === 3 ? 3 : 4);
+    setRaffleDigits(CONFIGURED_RAFFLE_DIGITS);
 
     const freeList=[];
 
@@ -3832,7 +3877,7 @@ async function syncMapFast(){
     // En Sheets corresponden al bloque de filas 2..1001 (fila 1 = encabezado).
     const firstDataIndex = 1;
     const lastExclusive = RAFFLE_DIGITS === 3
-      ? Math.min(rows.length, 1001)
+      ? Math.min(rows.length, 1001)   // índices 1..1000 = filas Sheets 2..1001
       : rows.length;
 
     for(let i=firstDataIndex; i<lastExclusive; i++){
@@ -4211,6 +4256,9 @@ document.addEventListener('DOMContentLoaded', async ()=>{
   const randomBtn=document.getElementById('randomButton');
   randomBtn.addEventListener('click', async ()=>{
     if(randomBtn.dataset.busy==='1') return; randomBtn.dataset.busy='1';
+
+    // La sucursal manda siempre: 3 => 000..999, 4 => 0000..9999.
+    setRaffleDigits(CONFIGURED_RAFFLE_DIGITS);
     hideMsg();
 
     const layer=document.getElementById('searchResult');
@@ -4273,6 +4321,11 @@ document.addEventListener('DOMContentLoaded', async ()=>{
   }
 
   // ARRANQUE EXPRESS (con boot)
+  bootSet(58, 'Configurando rifa…', 'Leyendo cantidad de cifras desde Sucursales!F');
+
+  // DEFINITIVO: Sucursales!F manda antes de caché, buscador, aleatorio y grilla.
+  await resolveRaffleDigitsFromBranchConfig();
+
   bootSet(60, 'Cargando boletas…', 'Usando caché para abrir ultra rápido');
   DAY_MARK=todayKey();
 
