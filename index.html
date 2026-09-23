@@ -2602,7 +2602,7 @@ const CACHE_META = Object.freeze({
   path: location.pathname
 });
 
-const MAP_CACHE_KEY   = `${CACHE_NS}_map_v5`;
+const MAP_CACHE_KEY   = `${CACHE_NS}_map_v6`;
 const CONF_CACHE_KEY  = `${CACHE_NS}_conf_v1`;
 const LOGO_CACHE_KEY  = `${CACHE_NS}_logo_v1`;
 const BLOCK_CACHE_KEY = `${CACHE_NS}_block_v1`;
@@ -2828,7 +2828,7 @@ async function fetchWithTimeout(url, timeout=6000){
     const u = new URL(cleanUrl);
     const match = u.pathname.match(/\/spreadsheets\/d\/([^/]+)/);
     const gid = u.searchParams.get('gid');
-    if(match && gid){
+    if(match && gid && !u.pathname.includes('/gviz/tq')){
       gvizUrl = `https://docs.google.com/spreadsheets/d/${match[1]}/gviz/tq?tqx=out:csv&gid=${encodeURIComponent(gid)}`;
     }
   }catch(_){}
@@ -2851,6 +2851,34 @@ async function fetchWithTimeout(url, timeout=6000){
   }
 
   throw lastError || new Error('No fue posible leer Google Sheets');
+}
+
+
+async function fetchCsvAny(gid, timeoutEach=6000){
+  const urls = csvUrls(gid);
+
+  // Prueba las alternativas y devuelve la primera respuesta CSV válida.
+  const attempts = urls.map(u =>
+    fetchWithTimeout(u, timeoutEach).then(txt => {
+      if(txt && !txt.trimStart().startsWith('<')) return txt;
+      throw new Error('Respuesta CSV inválida');
+    })
+  );
+
+  return new Promise((resolve, reject)=>{
+    let rejected = 0;
+    let lastError = null;
+
+    attempts.forEach(p=>{
+      p.then(resolve).catch(err=>{
+        lastError = err;
+        rejected++;
+        if(rejected === attempts.length){
+          reject(lastError || new Error('No fue posible leer el CSV'));
+        }
+      });
+    });
+  });
 }
 
 function rangeUrlsBySheet(sheetName, rangeA1){
